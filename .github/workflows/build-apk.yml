@@ -1,22 +1,611 @@
 name: Build Stepwgn NR-MZ25 13-Band DSQ APK
 on: [push, workflow_dispatch]
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-      - uses: gradle/actions/setup-gradle@v3
-      - name: Compile APK
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Generate Clean Project & Compile Stepwgn APK
         run: |
-          PROJECT_FILE=$(find . -name "settings.gradle.kts" | head -n 1)
-          cd "$(dirname "$PROJECT_FILE")"
+          mkdir -p /tmp/stepwgn_apk/app/src/main/java/com/jagastech/stepwgndsq
+
+          cat << 'EOF' > /tmp/stepwgn_apk/settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "StepwgnDSQ"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.jagastech.stepwgndsq"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.jagastech.stepwgndsq"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 3
+                  versionName = "3.0-UltraLight-Stepwgn"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          dependencies {}
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="NR-MZ25 DSQ 13-Band"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <action android:name="android.media.action.DISPLAY_AUDIO_EFFECT_CONTROL_PANEL" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".DsqAudioEngineService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback"
+                      android:stopWithTask="false" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:directBootAware="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/app/src/main/java/com/jagastech/stepwgndsq/BootReceiver.kt
+          package com.jagastech.stepwgndsq
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  val serviceIntent = Intent(context, DsqAudioEngineService::class.java)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      context.startForegroundService(serviceIntent)
+                  } else {
+                      context.startService(serviceIntent)
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/app/src/main/java/com/jagastech/stepwgndsq/DsqAudioEngineService.kt
+          package com.jagastech.stepwgndsq
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.SharedPreferences
+          import android.media.audiofx.AudioEffect
+          import android.media.audiofx.DynamicsProcessing
+          import android.media.audiofx.Equalizer
+          import android.media.audiofx.LoudnessEnhancer
+          import android.media.audiofx.Virtualizer
+          import android.os.Binder
+          import android.os.Build
+          import android.os.IBinder
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
+
+          class DsqAudioEngineService : Service() {
+              inner class LocalBinder : Binder() {
+                  fun getService(): DsqAudioEngineService = this@DsqAudioEngineService
+              }
+
+              private val binder = LocalBinder()
+              private lateinit var prefs: SharedPreferences
+              private val activeDynamicsProcessors = mutableMapOf<Int, DynamicsProcessing>()
+              private val activeLegacyEqualizers = mutableMapOf<Int, Equalizer>()
+              private val activeLoudnessEnhancers = mutableMapOf<Int, LoudnessEnhancer>()
+              private val activeVirtualizers = mutableMapOf<Int, Virtualizer>()
+
+              val centerFrequenciesHz = intArrayOf(50, 80, 125, 200, 315, 500, 800, 1250, 2000, 3150, 5000, 8000, 16000)
+              private val bandCutoffFrequenciesHz = floatArrayOf(63f, 100f, 160f, 250f, 400f, 630f, 1000f, 1600f, 2500f, 4000f, 6300f, 11300f, 20000f)
+              private val loudnessWeights = floatArrayOf(1.00f, 0.85f, 0.45f, 0.10f, 0.00f, 0.00f, 0.00f, 0.00f, 0.10f, 0.15f, 0.30f, 0.50f, 0.70f)
+              private val spatialStageWeights = floatArrayOf(0.05f, 0.05f, 0.10f, 0.15f, 0.15f, 0.20f, 0.25f, 0.35f, 0.55f, 0.65f, 0.70f, 0.85f, 1.00f)
+
+              var currentGainsDb = floatArrayOf(3f, 5f, 3f, -1f, -2f, 0f, -1f, 1f, 2f, 1f, 3f, 4f, 4f)
+              var loudnessGainDb: Float = 6f
+              var spatialStrengthPct: Int = 65
+              var isDspActive: Boolean = true
+              var isAutoTrimActive: Boolean = true
+
+              private val sessionReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      val sessionId = intent?.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0) ?: 0
+                      when (intent?.action) {
+                          AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> attachToSession(sessionId)
+                          AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> releaseSession(sessionId)
+                      }
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = getSharedPreferences("stepwgn_nrmz25_prefs", Context.MODE_PRIVATE)
+                  loadSavedSettings()
+                  startForegroundNotification()
+                  attachToSession(0)
+
+                  val filter = IntentFilter().apply {
+                      addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+                      addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(sessionReceiver, filter, Context.RECEIVER_EXPORTED)
+                  } else {
+                      registerReceiver(sessionReceiver, filter)
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  applyGainsToEngine()
+                  return START_STICKY
+              }
+
+              override fun onTaskRemoved(rootIntent: Intent?) {
+                  val restartIntent = Intent(applicationContext, DsqAudioEngineService::class.java)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      applicationContext.startForegroundService(restartIntent)
+                  } else {
+                      applicationContext.startService(restartIntent)
+                  }
+                  super.onTaskRemoved(rootIntent)
+              }
+
+              private fun saveSettings() {
+                  val editor = prefs.edit()
+                  for (i in 0 until 13) editor.putFloat("band_$i", currentGainsDb[i])
+                  editor.putFloat("loudness_db", loudnessGainDb)
+                  editor.putInt("spatial_pct", spatialStrengthPct)
+                  editor.putBoolean("dsp_active", isDspActive)
+                  editor.apply()
+              }
+
+              private fun loadSavedSettings() {
+                  if (!prefs.contains("band_0")) return
+                  for (i in 0 until 13) currentGainsDb[i] = prefs.getFloat("band_$i", currentGainsDb[i])
+                  loudnessGainDb = prefs.getFloat("loudness_db", 6f)
+                  spatialStrengthPct = prefs.getInt("spatial_pct", 65)
+                  isDspActive = prefs.getBoolean("dsp_active", true)
+              }
+
+              private fun attachToSession(sessionId: Int) {
+                  try {
+                      if (!activeLoudnessEnhancers.containsKey(sessionId)) {
+                          activeLoudnessEnhancers[sessionId] = LoudnessEnhancer(sessionId).apply {
+                              enabled = isDspActive && loudnessGainDb > 0f
+                          }
+                      }
+                  } catch (_: Exception) {}
+
+                  try {
+                      if (!activeVirtualizers.containsKey(sessionId)) {
+                          activeVirtualizers[sessionId] = Virtualizer(100, sessionId).apply {
+                              try { forceVirtualizationMode(Virtualizer.VIRTUALIZATION_MODE_TRANSAURAL) } catch (_: Exception) {}
+                              enabled = isDspActive && spatialStrengthPct > 0
+                          }
+                      }
+                  } catch (_: Exception) {}
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                      try {
+                          if (!activeDynamicsProcessors.containsKey(sessionId)) {
+                              val config = DynamicsProcessing.Config.Builder(
+                                  DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                                  2, true, 13, false, 0, true, 13, true
+                              ).build()
+                              activeDynamicsProcessors[sessionId] = DynamicsProcessing(100, sessionId, config).apply {
+                                  enabled = isDspActive
+                              }
+                          }
+                          applyGainsToEngine()
+                          return
+                      } catch (_: Exception) {}
+                  }
+
+                  try {
+                      if (!activeLegacyEqualizers.containsKey(sessionId)) {
+                          activeLegacyEqualizers[sessionId] = Equalizer(100, sessionId).apply {
+                              enabled = isDspActive
+                          }
+                      }
+                      applyGainsToEngine()
+                  } catch (_: Exception) {}
+              }
+
+              private fun releaseSession(sessionId: Int) {
+                  if (sessionId == 0) return
+                  activeDynamicsProcessors.remove(sessionId)?.release()
+                  activeLegacyEqualizers.remove(sessionId)?.release()
+                  activeLoudnessEnhancers.remove(sessionId)?.release()
+                  activeVirtualizers.remove(sessionId)?.release()
+              }
+
+              private fun getCompositeBandGainDb(i: Int): Float {
+                  if (!isDspActive) return 0f
+                  val base = currentGainsDb[i]
+                  val loudBoost = loudnessGainDb * loudnessWeights[i] * 0.55f
+                  val spatialLift = (spatialStrengthPct / 100f) * 2.5f * spatialStageWeights[i]
+                  return (base + loudBoost + spatialLift).coerceIn(-14f, 14f)
+              }
+
+              fun applyGainsToEngine() {
+                  saveSettings()
+                  val compositePeaks = FloatArray(13) { getCompositeBandGainDb(it) }
+                  val maxBoost = compositePeaks.maxOrNull() ?: 0f
+                  val preTrimDb = if (isDspActive && isAutoTrimActive && maxBoost > 0f) -maxBoost else 0f
+
+                  val targetLoudnessMb = if (isDspActive) (loudnessGainDb * 80f).roundToInt() else 0
+                  for ((_, le) in activeLoudnessEnhancers) {
+                      try {
+                          le.setTargetGain(targetLoudnessMb)
+                          le.enabled = isDspActive && loudnessGainDb > 0f
+                      } catch (_: Exception) {}
+                  }
+
+                  val targetVirtualizerStrength = if (isDspActive) (spatialStrengthPct * 10).coerceIn(0, 1000).toShort() else 0
+                  for ((_, virt) in activeVirtualizers) {
+                      try {
+                          if (virt.strengthSupported) virt.setStrength(targetVirtualizerStrength)
+                          virt.enabled = isDspActive && spatialStrengthPct > 0
+                      } catch (_: Exception) {}
+                  }
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activeDynamicsProcessors.isNotEmpty()) {
+                      val preEq = DynamicsProcessing.Eq(true, true, 13)
+                      val postEqLeft = DynamicsProcessing.Eq(true, true, 13)
+                      val postEqRight = DynamicsProcessing.Eq(true, true, 13)
+                      val spatialFactor = if (isDspActive) (spatialStrengthPct / 100f) * 1.35f else 0f
+
+                      for (i in 0 until 13) {
+                          val gain = getCompositeBandGainDb(i)
+                          preEq.setBand(i, DynamicsProcessing.EqBand(true, bandCutoffFrequenciesHz[i], gain))
+                          val panDelta = if (i >= 6) (if (i % 2 == 0) spatialFactor else -spatialFactor) else 0f
+                          postEqLeft.setBand(i, DynamicsProcessing.EqBand(true, bandCutoffFrequenciesHz[i], panDelta))
+                          postEqRight.setBand(i, DynamicsProcessing.EqBand(true, bandCutoffFrequenciesHz[i], -panDelta))
+                      }
+                      for ((_, dp) in activeDynamicsProcessors) {
+                          dp.setInputGainAllChannelsTo(preTrimDb)
+                          dp.setPreEqAllChannelsTo(preEq)
+                          dp.setPostEqByChannelIndex(0, postEqLeft)
+                          dp.setPostEqByChannelIndex(1, postEqRight)
+                          dp.enabled = isDspActive
+                      }
+                  }
+
+                  for ((_, eq) in activeLegacyEqualizers) {
+                      val numBands = eq.numberOfBands.toInt()
+                      val range = eq.bandLevelRange
+                      for (b in 0 until numBands) {
+                          val centerHz = eq.getCenterFreq(b.toShort()) / 1000
+                          val nearestIdx = centerFrequenciesHz.indices.minByOrNull { abs(centerFrequenciesHz[it] - centerHz) } ?: 0
+                          val targetDb = getCompositeBandGainDb(nearestIdx)
+                          val targetMillibel = (targetDb * 100f).roundToInt().coerceIn(range[0].toInt(), range[1].toInt())
+                          eq.setBandLevel(b.toShort(), targetMillibel.toShort())
+                      }
+                      eq.enabled = isDspActive
+                  }
+              }
+
+              private fun startForegroundNotification() {
+                  val channelId = "stepwgn_dsq_channel"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(channelId, "Stepwgn NR-MZ25 13-Band DSQ", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+                      val openUiIntent = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                      val notification = Notification.Builder(this, channelId)
+                          .setContentTitle("Stepwgn 13-Band DSQ + Spatial 3D Active")
+                          .setContentText("Running across ZLink 6, Bluetooth & USB (<8MB RAM)")
+                          .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+                          .setContentIntent(openUiIntent)
+                          .setOngoing(true)
+                          .build()
+                      startForeground(1001, notification)
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  try { unregisterReceiver(sessionReceiver) } catch (_: Exception) {}
+                  activeDynamicsProcessors.values.forEach { it.release() }
+                  activeLegacyEqualizers.values.forEach { it.release() }
+                  activeLoudnessEnhancers.values.forEach { it.release() }
+                  activeVirtualizers.values.forEach { it.release() }
+              }
+
+              override fun onBind(intent: Intent?): IBinder = binder
+          }
+          EOF
+
+          cat << 'EOF' > /tmp/stepwgn_apk/app/src/main/java/com/jagastech/stepwgndsq/MainActivity.kt
+          package com.jagastech.stepwgndsq
+
+          import android.app.Activity
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.ServiceConnection
+          import android.graphics.Color
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.Window
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.SeekBar
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              private var dsqService: DsqAudioEngineService? = null
+              private var selectedBandIndex = 1
+              private val bandValueLabels = mutableListOf<TextView>()
+              private val bandSeekBars = mutableListOf<SeekBar>()
+              private lateinit var activeBandTitle: TextView
+              private lateinit var loudnessStatusTv: TextView
+              private lateinit var spatialStatusTv: TextView
+
+              private val connection = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                      val binder = service as DsqAudioEngineService.LocalBinder
+                      dsqService = binder.getService()
+                      refreshHeadUnitUI()
+                  }
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      dsqService = null
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  requestWindowFeature(Window.FEATURE_NO_TITLE)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#0B0E14"))
+                      setPadding(20, 12, 20, 12)
+                  }
+
+                  fun makeHwButton(label: String, bgHex: String = "#1E293B", onClick: () -> Unit): Button {
+                      return Button(this).apply {
+                          text = label
+                          textSize = 11f
+                          setTextColor(Color.WHITE)
+                          setBackgroundColor(Color.parseColor(bgHex))
+                          setOnClickListener { onClick() }
+                      }
+                  }
+
+                  val commandBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(12, 8, 12, 8)
+                      setBackgroundColor(Color.parseColor("#131822"))
+                  }
+
+                  activeBandTitle = TextView(this).apply {
+                      text = "BAND 2 (80 Hz): +5 dB"
+                      textSize = 15f
+                      setTextColor(Color.parseColor("#F59E0B"))
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+                  commandBar.addView(activeBandTitle)
+                  commandBar.addView(makeHwButton("◀ BAND") { selectedBandIndex = (selectedBandIndex + 12) % 13; refreshHeadUnitUI() })
+                  commandBar.addView(makeHwButton("-1 dB", "#B45309") { stepSelectedBand(-1f) })
+                  commandBar.addView(makeHwButton("0 dB") { setSelectedBand(0f) })
+                  commandBar.addView(makeHwButton("+1 dB", "#047857") { stepSelectedBand(1f) })
+                  commandBar.addView(makeHwButton("BAND ▶") { selectedBandIndex = (selectedBandIndex + 1) % 13; refreshHeadUnitUI() })
+
+                  val fxBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(12, 8, 12, 8)
+                      setBackgroundColor(Color.parseColor("#161F2E"))
+                  }
+                  loudnessStatusTv = TextView(this).apply {
+                      text = "LOUD: +6dB"
+                      textSize = 12f
+                      setTextColor(Color.parseColor("#10B981"))
+                      setPadding(0, 0, 10, 0)
+                  }
+                  fxBar.addView(loudnessStatusTv)
+                  listOf(0f to "OFF", 3f to "+3dB", 6f to "+6dB", 9f to "+9dB").forEach { (db, lbl) ->
+                      fxBar.addView(makeHwButton(lbl) {
+                          dsqService?.let { it.loudnessGainDb = db; it.applyGainsToEngine(); refreshHeadUnitUI() }
+                      })
+                  }
+
+                  spatialStatusTv = TextView(this).apply {
+                      text = "  3D: 65%"
+                      textSize = 12f
+                      setTextColor(Color.parseColor("#A78BFA"))
+                      setPadding(12, 0, 10, 0)
+                  }
+                  fxBar.addView(spatialStatusTv)
+                  listOf(0 to "OFF", 40 to "DASH", 65 to "CABIN", 95 to "3D MAX").forEach { (pct, lbl) ->
+                      fxBar.addView(makeHwButton(lbl, "#4C1D95") {
+                          dsqService?.let { it.spatialStrengthPct = pct; it.applyGainsToEngine(); refreshHeadUnitUI() }
+                      })
+                  }
+
+                  val presetRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(0, 8, 0, 8)
+                  }
+                  val presets = linkedMapOf(
+                      "SpaceBuds 4" to floatArrayOf(3f, 5f, 3f, -1f, -2f, 0f, -1f, 1f, 2f, 1f, 3f, 4f, 4f),
+                      "SpaceBuds 2" to floatArrayOf(4f, 4f, 2f, 0f, -1f, -1f, 0f, 1f, 2f, 2f, 3f, 3f, 2f),
+                      "Stepwgn De-Box" to floatArrayOf(2f, 4f, 3f, -2f, -3f, 0f, 0f, 1f, 2f, 1f, 2f, 3f, 3f),
+                      "Amapiano 80Hz" to floatArrayOf(4f, 6f, 4f, -2f, -2f, -1f, 0f, 1f, 2f, 2f, 4f, 5f, 4f),
+                      "Flat 0dB" to FloatArray(13) { 0f }
+                  )
+                  for ((name, curve) in presets) {
+                      presetRow.addView(makeHwButton(name) {
+                          dsqService?.let { it.currentGainsDb = curve.clone(); it.applyGainsToEngine(); refreshHeadUnitUI() }
+                      })
+                  }
+
+                  val faderRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                  }
+                  val labels = listOf("50", "80", "125", "200", "315", "500", "800", "1.25k", "2k", "3.15k", "5k", "8k", "16k")
+                  for (i in 0 until 13) {
+                      val col = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER_HORIZONTAL
+                          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                          setOnClickListener { selectedBandIndex = i; refreshHeadUnitUI() }
+                      }
+                      val valTv = TextView(this).apply { text = "0dB"; textSize = 11f; setTextColor(Color.parseColor("#38BDF8")) }
+                      val seek = SeekBar(this).apply {
+                          max = 24
+                          progress = 12
+                          setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                              override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                                  if (fromUser) { selectedBandIndex = i; setSelectedBand((p - 12).toFloat()) }
+                              }
+                              override fun onStartTrackingTouch(s: SeekBar?) {}
+                              override fun onStopTrackingTouch(s: SeekBar?) {}
+                          })
+                      }
+                      val freqTv = TextView(this).apply { text = labels[i]; textSize = 11f; setTextColor(Color.WHITE) }
+                      bandValueLabels.add(valTv)
+                      bandSeekBars.add(seek)
+                      col.addView(valTv); col.addView(seek); col.addView(freqTv)
+                      faderRow.addView(col)
+                  }
+
+                  root.addView(commandBar)
+                  root.addView(fxBar)
+                  root.addView(presetRow)
+                  root.addView(faderRow)
+                  setContentView(root)
+
+                  Intent(this, DsqAudioEngineService::class.java).also { intent ->
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
+                      bindService(intent, connection, Context.BIND_AUTO_CREATE)
+                  }
+              }
+
+              private fun stepSelectedBand(delta: Float) {
+                  val current = dsqService?.currentGainsDb?.get(selectedBandIndex) ?: 0f
+                  setSelectedBand((current + delta).coerceIn(-12f, 12f))
+              }
+
+              private fun setSelectedBand(newDb: Float) {
+                  dsqService?.let { it.currentGainsDb[selectedBandIndex] = newDb; it.applyGainsToEngine(); refreshHeadUnitUI() }
+              }
+
+              private fun refreshHeadUnitUI() {
+                  val svc = dsqService ?: return
+                  val freq = svc.centerFrequenciesHz[selectedBandIndex]
+                  val gain = svc.currentGainsDb[selectedBandIndex]
+                  activeBandTitle.text = "BAND ${selectedBandIndex + 1} (${freq} Hz): ${if (gain >= 0) "+" else ""}${gain.toInt()} dB"
+                  loudnessStatusTv.text = "LOUD: +${svc.loudnessGainDb.toInt()}dB"
+                  spatialStatusTv.text = "  3D: ${svc.spatialStrengthPct}%"
+                  for (i in 0 until 13) {
+                      val g = svc.currentGainsDb[i].toInt()
+                      bandValueLabels[i].text = "${if (g >= 0) "+" else ""}${g}dB"
+                      bandSeekBars[i].progress = g + 12
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  unbindService(connection)
+              }
+          }
+          EOF
+
+          cd /tmp/stepwgn_apk
           gradle assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk $GITHUB_WORKSPACE/Stepwgn_NRMZ25_13Band_DSQ.apk
-      - uses: actions/upload-artifact@v4
+          cp /tmp/stepwgn_apk/app/build/outputs/apk/debug/app-debug.apk $GITHUB_WORKSPACE/Stepwgn_NRMZ25_13Band_DSQ.apk
+
+      - name: Upload Compiled Stepwgn APK
+        uses: actions/upload-artifact@v4
         with:
           name: Stepwgn-NRMZ25-13Band-DSQ-APK
           path: Stepwgn_NRMZ25_13Band_DSQ.apk
